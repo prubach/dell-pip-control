@@ -1,0 +1,9 @@
+<schemalist>
+  <schema id="org.gnome.shell.extensions.dell-pip-control" path="/org/gnome/shell/extensions/dell-pip-control/">
+    <key name="display-number" type="i">
+      <default>1</default>
+      <summary>ddcutil display number</summary>
+      <description>The --display N argument passed to ddcutil. Use ddcutil detect to find it.</description>
+    </key>
+  </schema>
+</schemalist>

@@ -1,0 +1,9 @@
+{
+    "uuid": "dell-pip-control@local",
+    "name": "Dell PIP/PBP Control",
+    "description": "Control Dell monitor PIP/PBP mode, input source, and USB via ddcutil from the top panel.",
+    "shell-version": ["45", "46", "47", "48", "49", "50"],
+    "url": "",
+    "version": 3,
+    "settings-schema": "org.gnome.shell.extensions.dell-pip-control"
+}
