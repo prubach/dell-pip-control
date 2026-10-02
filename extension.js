@@ -7,6 +7,8 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
+import {parseDisplays} from './ddcutil.js';
+
 // Label -> VCP feature/value mapping.
 // NOTE: labels are plain strings here (not wrapped in _()) because this module
 // is evaluated at import time, before an Extension instance exists; gettext()
@@ -97,14 +99,53 @@ class DellPipButton extends PanelMenu.Button {
         this.menu.addMenuItem(detectItem);
     }
 
-    _displayNumber() {
-        return this._settings.get_int('display-number');
-    }
-
     _runSetVcp(feature, value) {
-        const display = this._displayNumber();
-        const argv = ['ddcutil', '--display', String(display), 'setvcp', feature, value];
-        this._spawn(argv, `setvcp ${feature} ${value}`);
+        const model = this._settings.get_string('selected-model');
+        if (!model) {
+            Main.notifyError(_('Dell PIP/PBP Control'), _('Choose a monitor in the extension preferences.'));
+            return;
+        }
+
+        try {
+            const proc = Gio.Subprocess.new(
+                ['ddcutil', 'detect'],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+            proc.communicate_utf8_async(null, null, (source, res) => {
+                try {
+                    const [, stdout, stderr] = source.communicate_utf8_finish(res);
+                    const exitStatus = source.get_exit_status();
+                    if (exitStatus !== 0) {
+                        logError(new Error(stderr || 'unknown error'),
+                            '[dell-pip-control] ddcutil detect failed');
+                        Main.notifyError(_('Dell PIP/PBP Control'), _('Failed to detect displays.'));
+                        return;
+                    }
+
+                    const matches = parseDisplays(stdout).filter(display => display.model === model);
+                    if (matches.length === 0) {
+                        Main.notifyError(_('Dell PIP/PBP Control'),
+                            _('Selected monitor not found: %s').format(model));
+                        return;
+                    }
+                    if (matches.length > 1) {
+                        Main.notifyError(_('Dell PIP/PBP Control'),
+                            _('More than one connected monitor is named %s.').format(model));
+                        return;
+                    }
+
+                    const display = matches[0].number;
+                    const argv = ['ddcutil', '-d', String(display), 'setvcp', feature, value];
+                    this._spawn(argv, `setvcp ${feature} ${value} on ${model}`);
+                } catch (e) {
+                    logError(e, '[dell-pip-control] display detection communicate failed');
+                    Main.notifyError(_('Dell PIP/PBP Control'), _('Failed to detect displays.'));
+                }
+            });
+        } catch (e) {
+            logError(e, '[dell-pip-control] failed to spawn ddcutil detect');
+            Main.notifyError(_('Dell PIP/PBP Control'), _('Failed to run ddcutil detect.'));
+        }
     }
 
     _runDetect() {

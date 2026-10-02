@@ -1,9 +1,9 @@
 <schemalist>
   <schema id="org.gnome.shell.extensions.dell-pip-control" path="/org/gnome/shell/extensions/dell-pip-control/">
-    <key name="display-number" type="i">
-      <default>1</default>
-      <summary>ddcutil display number</summary>
-      <description>The --display N argument passed to ddcutil. Use ddcutil detect to find it.</description>
+    <key name="selected-model" type="s">
+      <default>''</default>
+      <summary>Selected monitor model</summary>
+      <description>The connected monitor model whose PIP/PBP controls should be changed.</description>
     </key>
   </schema>
 </schemalist>
