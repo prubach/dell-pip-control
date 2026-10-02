@@ -4,7 +4,7 @@ This is a Gnome Extension that allows you to control the Dell PIP (Picture-in-Pi
 
 
 ```
-cp -r dell-pip-control@local ~/.local/share/gnome-shell/extensions/
+rsync -av --progress --exclude=".*" * ~/.local/share/gnome-shell/extensions/dell-pip-control@local/
 glib-compile-schemas ~/.local/share/gnome-shell/extensions/dell-pip-control@local/schemas/
 ```
 
