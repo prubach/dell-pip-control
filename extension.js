@@ -8,6 +8,12 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 import {parseDisplays} from './ddcutil.js';
+import {
+    buildDisplayToggleCommand,
+    buildExtendCommand,
+    buildMirrorCommand,
+    parseXrandrQuery,
+} from './xrandr.js';
 
 // Label -> VCP feature/value mapping.
 // NOTE: labels are plain strings here (not wrapped in _()) because this module
@@ -29,12 +35,6 @@ const INPUTS = [
     { label: 'USB-C', value: '0x1b' },
 ];
 
-const DISPLAY_OUTPUTS = [
-    { label: 'Extend Display', feature: 'e8', value: '0x00' },
-    { label: 'Mirror Displays', feature: 'e8', value: '0x01' },
-    { label: 'Clone Display', feature: 'e8', value: '0x02' },
-];
-
 class DellPipButton extends PanelMenu.Button {
     static {
         GObject.registerClass(this);
@@ -43,6 +43,7 @@ class DellPipButton extends PanelMenu.Button {
     _init(settings) {
         super._init(0.0, _('Dell PIP/PBP Control'));
         this._settings = settings;
+        this._displayItems = [];
 
         const icon = new St.Icon({
             icon_name: 'video-display-symbolic',
@@ -51,6 +52,10 @@ class DellPipButton extends PanelMenu.Button {
         this.add_child(icon);
 
         this._buildMenu();
+        this.menu.connect('open-state-changed', (_menu, open) => {
+            if (open)
+                this._refreshXrandrMenu();
+        });
     }
 
     _buildMenu() {
@@ -62,7 +67,6 @@ class DellPipButton extends PanelMenu.Button {
         });
         title.setSensitive(false);
         this.menu.addMenuItem(title);
-        this.menu.addMenuBar();
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         for (const mode of MODES) {
@@ -101,7 +105,12 @@ class DellPipButton extends PanelMenu.Button {
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        // New section for Display Output
+        const detectDdcItem = new PopupMenu.PopupMenuItem(_('Detect monitors (ddcutil)'));
+        detectDdcItem.connect('activate', () => this._runDdcDetect());
+        this.menu.addMenuItem(detectDdcItem);
+
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
         const displayTitle = new PopupMenu.PopupMenuItem(_('Display Output'), {
             reactive: false,
             style_class: 'popup-menu-item-header',
@@ -109,20 +118,31 @@ class DellPipButton extends PanelMenu.Button {
         displayTitle.setSensitive(false);
         this.menu.addMenuItem(displayTitle);
 
-        for (const output of DISPLAY_OUTPUTS) {
-            const item = new PopupMenu.PopupMenuItem(_(output.label));
-            item.connect('activate', () => this._runSetXrandr(output.feature, output.value));
-            this.menu.addMenuItem(item);
-        }
+        const extendItem = new PopupMenu.PopupMenuItem(_('Extend displays'));
+        extendItem.connect('activate', () => this._runXrandrLayout(buildExtendCommand, 'extend displays', 1));
+        this.menu.addMenuItem(extendItem);
 
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        const mirrorItem = new PopupMenu.PopupMenuItem(_('Mirror displays'));
+        mirrorItem.connect('activate', () => this._runXrandrLayout(
+            buildMirrorCommand,
+            'mirror displays',
+            2,
+            _('No common resolution is available for mirroring.')
+        ));
+        this.menu.addMenuItem(mirrorItem);
 
-        const detectItem = new PopupMenu.PopupMenuItem(_('Detect displays (xrandr)'));
-        detectItem.connect('activate', () => this._runDetect());
-        this.menu.addMenuItem(detectItem);
+        const refreshItem = new PopupMenu.PopupMenuItem(_('Refresh displays (xrandr)'));
+        refreshItem.connect('activate', () => this._refreshXrandrMenu());
+        this.menu.addMenuItem(refreshItem);
+
+        this._displayStatusItem = new PopupMenu.PopupMenuItem(_('Loading displays…'), {
+            reactive: false,
+        });
+        this._displayStatusItem.setSensitive(false);
+        this.menu.addMenuItem(this._displayStatusItem);
     }
 
-    _runSetXrandr(feature, value) {
+    _runSetVcp(feature, value) {
         const model = this._settings.get_string('selected-model');
         if (!model) {
             Main.notifyError(_('Dell PIP/PBP Control'), _('Choose a monitor in the extension preferences.'));
@@ -131,7 +151,7 @@ class DellPipButton extends PanelMenu.Button {
 
         try {
             const proc = Gio.Subprocess.new(
-                ['xrandr', '--listmonitors'],
+                ['ddcutil', 'detect'],
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
             );
             proc.communicate_utf8_async(null, null, (source, res) => {
@@ -140,91 +160,38 @@ class DellPipButton extends PanelMenu.Button {
                     const exitStatus = source.get_exit_status();
                     if (exitStatus !== 0) {
                         logError(new Error(stderr || 'unknown error'),
-                            '[dell-pip-control] xrandr detect failed');
-                        Main.notifyError(_('Dell PIP/PBP Control'), _('Failed to detect displays.'));
+                            '[dell-pip-control] ddcutil detect failed');
+                        Main.notifyError(_('Dell PIP/PBP Control'), _('Failed to detect monitors.'));
                         return;
                     }
 
-                    const monitors = this._parseXrandrOutput(stdout);
-                    if (monitors.length === 0) {
+                    const matches = parseDisplays(stdout).filter(display => display.model === model);
+                    if (matches.length === 0) {
                         Main.notifyError(_('Dell PIP/PBP Control'),
-                            _('No displays detected. Ensure xrandr is installed and monitors are connected.'));
+                            _('Selected monitor not found: %s').format(model));
                         return;
                     }
-
-                    if (monitors.length > 1) {
+                    if (matches.length > 1) {
                         Main.notifyError(_('Dell PIP/PBP Control'),
-                            _('Multiple displays detected. Choose one in the extension preferences.'));
+                            _('More than one connected monitor is named %s.').format(model));
                         return;
                     }
 
-                    const display = monitors[0].name;
-                    const command = this._buildXrandrCommand(display, feature, value);
-                    this._spawn(command, `setxrandr ${feature} ${value} on ${model}`);
+                    const display = matches[0].number;
+                    const argv = ['ddcutil', '-d', String(display), 'setvcp', feature, value];
+                    this._spawn(argv, `setvcp ${feature} ${value} on ${model}`, 'ddcutil');
                 } catch (e) {
-                    logError(e, '[dell-pip-control] display detection communicate failed');
-                    Main.notifyError(_('Dell PIP/PBP Control'), _('Failed to detect displays.'));
+                    logError(e, '[dell-pip-control] ddcutil detection communicate failed');
+                    Main.notifyError(_('Dell PIP/PBP Control'), _('Failed to detect monitors.'));
                 }
             });
         } catch (e) {
-            logError(e, '[dell-pip-control] failed to spawn xrandr');
-            Main.notifyError(_('Dell PIP/PBP Control'), _('Failed to run xrandr. Is it installed?'));
+            logError(e, '[dell-pip-control] failed to spawn ddcutil detect');
+            Main.notifyError(_('Dell PIP/PBP Control'), _('Failed to run ddcutil detect.'));
         }
     }
 
-    _parseXrandrOutput(output) {
-        const lines = output.split('\n');
-        const monitors = [];
-        let currentMonitor = null;
-
-        for (const line of lines) {
-            if (line.startsWith('  ')) {
-                if (currentMonitor) {
-                    monitors.push(currentMonitor);
-                }
-                const name = line.trim().split(' ')[0];
-                currentMonitor = { name };
-            } else if (line.startsWith('Monitors:')) {
-                // Skip header
-            } else {
-                if (currentMonitor) {
-                    currentMonitor.resolution = line.trim();
-                }
-            }
-        }
-
-        if (currentMonitor) {
-            monitors.push(currentMonitor);
-        }
-
-        return monitors;
-    }
-
-    _buildXrandrCommand(display, feature, value) {
-        const command = [];
-        const [monitor] = display.split(' ');
-        const [width, height] = display.split(' ').pop().split('x');
-
-        // Set resolution
-        command.push(`--output ${monitor} --mode ${width}x${height}`);
-
-        // Set display mode
-        switch (feature) {
-            case 'e8':
-                switch (value) {
-                    case '0x00': command.push('--output ${monitor} --mode ${width}x${height}'); break;
-                    case '0x01': command.push('--output ${monitor} --mode ${width}x${height}'); break;
-                    case '0x02': command.push('--output ${monitor} --mode ${width}x${height}'); break;
-                }
-                break;
-            default:
-                break;
-        }
-
-        return ['xrandr', ...command];
-    }
-
-    _spawn(argv, description) {
+    _spawn(argv, description, commandName = 'xrandr', onSuccess = null) {
         try {
             const proc = Gio.Subprocess.new(
                 argv,
@@ -241,6 +208,7 @@ class DellPipButton extends PanelMenu.Button {
                             _('Command failed: %s').format(description));
                     } else {
                         log(`[dell-pip-control] ${description} succeeded`);
+                        onSuccess?.();
                     }
                 } catch (e) {
                     logError(e, `[dell-pip-control] ${description} communicate failed`);
@@ -248,42 +216,133 @@ class DellPipButton extends PanelMenu.Button {
             });
         } catch (e) {
             logError(e, `[dell-pip-control] failed to spawn ${argv.join(' ')}`);
-            Main.notifyError(_('Dell PIP/PBP Control'), _('Failed to run xrandr. Is it installed?'));
+            Main.notifyError(_('Dell PIP/PBP Control'),
+                _('Failed to run %s. Is it installed?').format(commandName));
         }
     }
 
-    _runDetect() {
+    _runDdcDetect() {
         try {
             const proc = Gio.Subprocess.new(
-                ['xrandr', '--listmonitors'],
+                ['ddcutil', 'detect'],
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
             );
             proc.communicate_utf8_async(null, null, (source, res) => {
                 try {
                     const [, stdout, stderr] = source.communicate_utf8_finish(res);
-                    log(`[dell-pip-control] xrandr detect output:\n${stdout || stderr}`);
-                    Main.notify(_('Dell PIP/PBP Control'), _('See journalctl (log) for xrandr output.'));
+                    log(`[dell-pip-control] ddcutil detect output:\n${stdout || stderr}`);
+                    Main.notify(_('Dell PIP/PBP Control'), _('See journalctl (log) for ddcutil output.'));
                 } catch (e) {
-                    logError(e, '[dell-pip-control] detect communicate failed');
+                    logError(e, '[dell-pip-control] ddcutil detect communicate failed');
+                }
+            });
+        } catch (e) {
+            logError(e, '[dell-pip-control] failed to spawn ddcutil detect');
+            Main.notifyError(_('Dell PIP/PBP Control'), _('Failed to run ddcutil detect.'));
+        }
+    }
+
+    _refreshXrandrMenu() {
+        try {
+            const proc = Gio.Subprocess.new(
+                ['xrandr', '--query'],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+            proc.communicate_utf8_async(null, null, (source, res) => {
+                try {
+                    const [, stdout, stderr] = source.communicate_utf8_finish(res);
+                    if (source.get_exit_status() !== 0) {
+                        this._setXrandrStatus(_('Failed to query displays: %s').format(stderr.trim()));
+                        logError(new Error(stderr || 'unknown error'), '[dell-pip-control] xrandr query failed');
+                        return;
+                    }
+
+                    const displays = parseXrandrQuery(stdout);
+                    this._clearDisplayItems();
+                    if (displays.length === 0) {
+                        this._displayStatusItem.label.text = _('No connected displays found.');
+                        return;
+                    }
+
+                    this._displayStatusItem.label.text = _('Connected displays:');
+                    for (const display of displays) {
+                        const action = display.active ? _('Turn off') : _('Turn on');
+                        const item = new PopupMenu.PopupMenuItem(`${action} ${display.name}`);
+                        item.connect('activate', () => {
+                            const argv = buildDisplayToggleCommand(display, displays);
+                            this._spawn(argv, `${action.toLowerCase()} ${display.name}`,
+                                'xrandr', () => this._refreshXrandrMenu());
+                        });
+                        this._displayItems.push(item);
+                        this.menu.addMenuItem(item);
+                    }
+                } catch (e) {
+                    this._setXrandrStatus(_('Failed to read xrandr results.'));
+                    logError(e, '[dell-pip-control] xrandr query communicate failed');
+                }
+            });
+        } catch (e) {
+            this._setXrandrStatus(_('Could not run xrandr. Is it installed?'));
+            logError(e, '[dell-pip-control] failed to spawn xrandr');
+        }
+    }
+
+    _clearDisplayItems() {
+        for (const item of this._displayItems)
+            this.menu.removeMenuItem(item);
+        this._displayItems = [];
+    }
+
+    _setXrandrStatus(text) {
+        this._clearDisplayItems();
+        this._displayStatusItem.label.text = text;
+    }
+
+    _runXrandrLayout(
+        buildCommand,
+        description,
+        minimumDisplays,
+        invalidLayoutMessage = _('Could not configure the display layout.')
+    ) {
+        try {
+            const proc = Gio.Subprocess.new(
+                ['xrandr', '--query'],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+            proc.communicate_utf8_async(null, null, (source, res) => {
+                try {
+                    const [, stdout, stderr] = source.communicate_utf8_finish(res);
+                    if (source.get_exit_status() !== 0) {
+                        logError(new Error(stderr || 'unknown error'), '[dell-pip-control] xrandr query failed');
+                        Main.notifyError(_('Dell PIP/PBP Control'), _('Failed to query displays.'));
+                        return;
+                    }
+
+                    const displays = parseXrandrQuery(stdout);
+                    if (displays.length < minimumDisplays) {
+                        const message = minimumDisplays === 1
+                            ? _('No connected displays found.')
+                            : _('At least two connected displays are required.');
+                        Main.notifyError(_('Dell PIP/PBP Control'), message);
+                        return;
+                    }
+
+                    const argv = buildCommand(displays);
+                    if (!argv) {
+                        Main.notifyError(_('Dell PIP/PBP Control'), invalidLayoutMessage);
+                        return;
+                    }
+
+                    this._spawn(argv, description, 'xrandr', () => this._refreshXrandrMenu());
+                } catch (e) {
+                    logError(e, '[dell-pip-control] xrandr query communicate failed');
+                    Main.notifyError(_('Dell PIP/PBP Control'), _('Failed to query displays.'));
                 }
             });
         } catch (e) {
             logError(e, '[dell-pip-control] failed to spawn xrandr');
             Main.notifyError(_('Dell PIP/PBP Control'), _('Failed to run xrandr. Is it installed?'));
         }
-    }
-
-    _toggleDisplayMode() {
-        // Logic to cycle through display modes
-        // You can implement this based on current mode
-        // For simplicity, assume it toggles between Extend, Mirror, Clone
-        const modes = ['Extend', 'Mirror', 'Clone'];
-        const currentMode = this._settings.get_string('current-mode');
-        const index = modes.indexOf(currentMode);
-        const nextIndex = (index + 1) % modes.length;
-        const nextMode = modes[nextIndex];
-        this._settings.set_string('current-mode', nextMode);
-        this._runSetXrandr('e8', nextMode);
     }
 }
 
@@ -292,20 +351,6 @@ export default class DellPipControlExtension extends Extension {
         this._settings = this.getSettings();
         this._indicator = new DellPipButton(this._settings);
         Main.panel.addToStatusArea(this.uuid, this._indicator);
-
-        // Register keyboard shortcut SUPER+D
-        const shortcut = new Main.WMKeybinding(
-            'dell-pip-control-toggle', // Unique ID
-            'SUPER+D', // Keybinding
-            () => this._toggleDisplayMode(), // Callback
-            'Toggle Display Output' // Description
-        );
-        Main.keybindingManager.addKeybinding(
-            'dell-pip-control-toggle',
-            () => this._toggleDisplayMode(),
-            'dell-pip-control-toggle',
-            Main.WMKeybindingMode.NORMAL
-        );
     }
 
     disable() {

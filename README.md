@@ -1,6 +1,8 @@
 # Installation
 
-This is a Gnome Extension that allows you to control the Dell PIP (Picture-in-Picture) feature and Input Sources on supported Dell monitors.
+This GNOME Shell extension controls PIP/PBP mode, input sources, and USB routing on supported Dell monitors with `ddcutil`. It also provides xrandr controls to extend or mirror connected displays and turn each display on or off.
+
+The monitor for DDC controls is selected in the extension preferences. Install `ddcutil` for monitor controls and `xrandr` for display-layout controls. xrandr configuration is primarily supported in X11 sessions; under Wayland, its available controls may be limited by the Xwayland compatibility layer.
 
 
 ```
