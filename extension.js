@@ -1,4 +1,5 @@
 import Gio from 'gi://Gio';
+import Meta from 'gi://Meta';
 import GObject from 'gi://GObject';
 import St from 'gi://St';
 
@@ -8,6 +9,7 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 import {parseDisplays} from './ddcutil.js';
+import {getMutterState, listMutterDisplays, toggleMutterDisplay} from './mutter.js';
 import {
     buildDisplayToggleCommand,
     buildExtendCommand,
@@ -177,6 +179,12 @@ class DellPipButton extends PanelMenu.Button {
                         return;
                     }
 
+                    if (!matches[0].supported) {
+                        Main.notifyError(_('Dell PIP/PBP Control'),
+                            _('%s does not respond to DDC/CI. Enable DDC/CI in the monitor menu and check the cable.').format(model));
+                        return;
+                    }
+
                     const display = matches[0].number;
                     const argv = ['ddcutil', '-d', String(display), 'setvcp', feature, value];
                     this._spawn(argv, `setvcp ${feature} ${value} on ${model}`, 'ddcutil');
@@ -242,7 +250,49 @@ class DellPipButton extends PanelMenu.Button {
         }
     }
 
+    _isWayland() {
+        return Meta.is_wayland_compositor();
+    }
+
+    async _refreshMutterMenu() {
+        try {
+            const displays = listMutterDisplays(await getMutterState());
+            this._clearDisplayItems();
+            if (displays.length === 0) {
+                this._displayStatusItem.label.text = _('No connected displays found.');
+                return;
+            }
+
+            this._displayStatusItem.label.text = _('Connected displays:');
+            for (const display of displays) {
+                const action = display.active ? _('Turn off') : _('Turn on');
+                const item = new PopupMenu.PopupMenuItem(`${action} ${display.name}`);
+                item.connect('activate', async () => {
+                    try {
+                        await toggleMutterDisplay(display.name);
+                        log(`[dell-pip-control] ${action.toLowerCase()} ${display.name} succeeded`);
+                        this._refreshXrandrMenu();
+                    } catch (e) {
+                        logError(e, `[dell-pip-control] ${action.toLowerCase()} ${display.name} failed`);
+                        Main.notifyError(_('Dell PIP/PBP Control'),
+                            _('Command failed: %s').format(`${action.toLowerCase()} ${display.name}`));
+                    }
+                });
+                this._displayItems.push(item);
+                this.menu.addMenuItem(item);
+            }
+        } catch (e) {
+            this._setXrandrStatus(_('Failed to query displays.'));
+            logError(e, '[dell-pip-control] mutter display query failed');
+        }
+    }
+
     _refreshXrandrMenu() {
+        if (this._isWayland()) {
+            this._refreshMutterMenu();
+            return;
+        }
+
         try {
             const proc = Gio.Subprocess.new(
                 ['xrandr', '--query'],
