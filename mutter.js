@@ -118,12 +118,7 @@ export function buildToggledLayout(state, connector) {
     return layout;
 }
 
-export async function toggleMutterDisplay(connector) {
-    const state = await getMutterState();
-    const layout = buildToggledLayout(state, connector);
-    if (!layout)
-        throw new Error(`Cannot toggle ${connector}: it is the only active display or is unknown`);
-
+async function applyLayout(state, layout) {
     const logicalMonitors = layout.map(l => [
         l.x, l.y, l.scale, l.transform, l.primary,
         l.monitors.map(m => [m.connector, m.modeId, {}]),
@@ -132,4 +127,99 @@ export async function toggleMutterDisplay(connector) {
         state.serial, 1, logicalMonitors, {},
     ]);
     await callMutter('ApplyMonitorsConfig', params, null);
+}
+
+function orderMonitors(state, firstConnector) {
+    const first = state.monitors.find(m => m.connector === firstConnector);
+    const primary = state.logicalMonitors.find(l => l.primary);
+    const lead = first ?? state.monitors.find(m => m.connector === primary?.connectors[0]) ?? state.monitors[0];
+    return lead ? [lead, ...state.monitors.filter(m => m !== lead)] : [];
+}
+
+// Side-by-side layout, first monitor leftmost and primary, every monitor at its preferred mode.
+export function buildExtendLayout(state, firstConnector = null) {
+    const ordered = orderMonitors(state, firstConnector)
+        .map(monitor => ({monitor, mode: monitor.modes.find(m => m.preferred) ?? monitor.modes[0]}))
+        .filter(entry => entry.mode);
+    if (ordered.length === 0)
+        return null;
+
+    let x = 0;
+    return ordered.map(({monitor, mode}, i) => {
+        const entry = {
+            x, y: 0, scale: mode.scale, transform: 0, primary: i === 0,
+            monitors: [monitorModeId(monitor, mode)],
+        };
+        x += Math.round(mode.width / mode.scale);
+        return entry;
+    });
+}
+
+// One logical monitor containing all monitors at the best resolution they share.
+export function buildMirrorLayout(state, firstConnector = null) {
+    const ordered = orderMonitors(state, firstConnector);
+    if (ordered.length < 2)
+        return null;
+
+    const key = m => `${m.width}x${m.height}`;
+    const common = ordered[0].modes
+        .filter(mode => ordered.every(mon => mon.modes.some(m => key(m) === key(mode))))
+        .sort((a, b) => b.width * b.height - a.width * a.height);
+    if (common.length === 0)
+        return null;
+
+    const target = key(common[0]);
+    return [{
+        x: 0, y: 0, scale: common[0].scale, transform: 0, primary: true,
+        monitors: ordered.map(mon => monitorModeId(mon, mon.modes.find(m => key(m) === target))),
+    }];
+}
+
+export async function toggleMutterDisplay(connector) {
+    const state = await getMutterState();
+    const layout = buildToggledLayout(state, connector);
+    if (!layout)
+        throw new Error(`Cannot toggle ${connector}: it is the only active display or is unknown`);
+    await applyLayout(state, layout);
+}
+
+export async function extendMutterDisplays(firstConnector = null) {
+    const state = await getMutterState();
+    const layout = buildExtendLayout(state, firstConnector);
+    if (!layout)
+        throw new Error('No displays available to extend');
+    await applyLayout(state, layout);
+}
+
+export async function mirrorMutterDisplays(firstConnector = null) {
+    const state = await getMutterState();
+    const layout = buildMirrorLayout(state, firstConnector);
+    if (!layout)
+        throw new Error('No common resolution is available for mirroring');
+    await applyLayout(state, layout);
+}
+
+export function preferredModeKey(monitor) {
+    const mode = monitor?.modes.find(m => m.preferred) ?? monitor?.modes[0];
+    return mode ? `${mode.width}x${mode.height}` : null;
+}
+
+export function snapshotPreferredModes(state) {
+    return new Map(state.monitors.map(m => [m.connector, preferredModeKey(m)]));
+}
+
+// Resolves with the connector whose preferred mode changed (e.g. after PBP is switched), or null on timeout.
+export async function waitForModeChange(previous, timeoutMs = 10000) {
+    const deadline = GLib.get_monotonic_time() / 1000 + timeoutMs;
+    while (GLib.get_monotonic_time() / 1000 < deadline) {
+        await new Promise(resolve => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
+            resolve();
+            return GLib.SOURCE_REMOVE;
+        }));
+        const state = await getMutterState();
+        const changed = state.monitors.find(m => previous.get(m.connector) !== preferredModeKey(m));
+        if (changed)
+            return changed.connector;
+    }
+    return null;
 }

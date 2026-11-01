@@ -1,4 +1,5 @@
 import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import GObject from 'gi://GObject';
 import St from 'gi://St';
@@ -9,7 +10,15 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 import {parseDisplays} from './ddcutil.js';
-import {getMutterState, listMutterDisplays, toggleMutterDisplay} from './mutter.js';
+import {
+    extendMutterDisplays,
+    getMutterState,
+    listMutterDisplays,
+    mirrorMutterDisplays,
+    snapshotPreferredModes,
+    toggleMutterDisplay,
+    waitForModeChange,
+} from './mutter.js';
 import {
     buildDisplayToggleCommand,
     buildExtendCommand,
@@ -71,6 +80,10 @@ class DellPipButton extends PanelMenu.Button {
         this.menu.addMenuItem(title);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
+        const pbpExtendItem = new PopupMenu.PopupMenuItem(_('PBP + extend (one click)'));
+        pbpExtendItem.connect('activate', () => this._runPbpExtend());
+        this.menu.addMenuItem(pbpExtendItem);
+
         for (const mode of MODES) {
             const item = new PopupMenu.PopupMenuItem(_(mode.label));
             item.connect('activate', () => this._runSetVcp(mode.feature, mode.value));
@@ -121,16 +134,27 @@ class DellPipButton extends PanelMenu.Button {
         this.menu.addMenuItem(displayTitle);
 
         const extendItem = new PopupMenu.PopupMenuItem(_('Extend displays'));
-        extendItem.connect('activate', () => this._runXrandrLayout(buildExtendCommand, 'extend displays', 1));
+        extendItem.connect('activate', () => {
+            if (this._isWayland())
+                this._runMutterLayout(extendMutterDisplays, 'extend displays');
+            else
+                this._runXrandrLayout(buildExtendCommand, 'extend displays', 1);
+        });
         this.menu.addMenuItem(extendItem);
 
         const mirrorItem = new PopupMenu.PopupMenuItem(_('Mirror displays'));
-        mirrorItem.connect('activate', () => this._runXrandrLayout(
-            buildMirrorCommand,
-            'mirror displays',
-            2,
-            _('No common resolution is available for mirroring.')
-        ));
+        mirrorItem.connect('activate', () => {
+            if (this._isWayland()) {
+                this._runMutterLayout(mirrorMutterDisplays, 'mirror displays');
+                return;
+            }
+            this._runXrandrLayout(
+                buildMirrorCommand,
+                'mirror displays',
+                2,
+                _('No common resolution is available for mirroring.')
+            );
+        });
         this.menu.addMenuItem(mirrorItem);
 
         const refreshItem = new PopupMenu.PopupMenuItem(_('Refresh displays (xrandr)'));
@@ -144,7 +168,7 @@ class DellPipButton extends PanelMenu.Button {
         this.menu.addMenuItem(this._displayStatusItem);
     }
 
-    _runSetVcp(feature, value) {
+    _runSetVcp(feature, value, onSuccess = null) {
         const model = this._settings.get_string('selected-model');
         if (!model) {
             Main.notifyError(_('Dell PIP/PBP Control'), _('Choose a monitor in the extension preferences.'));
@@ -187,7 +211,9 @@ class DellPipButton extends PanelMenu.Button {
 
                     const display = matches[0].number;
                     const argv = ['ddcutil', '-d', String(display), 'setvcp', feature, value];
-                    this._spawn(argv, `setvcp ${feature} ${value} on ${model}`, 'ddcutil');
+                    const connector = matches[0].connector?.replace(/^card\d+-/, '') ?? null;
+                    this._spawn(argv, `setvcp ${feature} ${value} on ${model}`, 'ddcutil',
+                        onSuccess ? () => onSuccess(connector) : null);
                 } catch (e) {
                     logError(e, '[dell-pip-control] ddcutil detection communicate failed');
                     Main.notifyError(_('Dell PIP/PBP Control'), _('Failed to detect monitors.'));
@@ -248,6 +274,45 @@ class DellPipButton extends PanelMenu.Button {
             logError(e, '[dell-pip-control] failed to spawn ddcutil detect');
             Main.notifyError(_('Dell PIP/PBP Control'), _('Failed to run ddcutil detect.'));
         }
+    }
+
+    async _runMutterLayout(apply, description, firstConnector = null) {
+        try {
+            await apply(firstConnector);
+            log(`[dell-pip-control] ${description} succeeded`);
+            this._refreshXrandrMenu();
+        } catch (e) {
+            logError(e, `[dell-pip-control] ${description} failed`);
+            Main.notifyError(_('Dell PIP/PBP Control'), _('Command failed: %s').format(description));
+        }
+    }
+
+    // Switch the monitor to PBP, wait for the host to see the half-width mode, then extend
+    // with the Dell as the first (primary) display.
+    async _runPbpExtend() {
+        if (!this._isWayland()) {
+            this._runSetVcp('e9', '0x24', () => {
+                GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 4, () => {
+                    this._runXrandrLayout(buildExtendCommand, 'extend displays', 1);
+                    return GLib.SOURCE_REMOVE;
+                });
+            });
+            return;
+        }
+
+        let before;
+        try {
+            before = snapshotPreferredModes(await getMutterState());
+        } catch (e) {
+            logError(e, '[dell-pip-control] mutter display query failed');
+            Main.notifyError(_('Dell PIP/PBP Control'), _('Failed to query displays.'));
+            return;
+        }
+
+        this._runSetVcp('e9', '0x24', async ddcConnector => {
+            const changed = await waitForModeChange(before);
+            this._runMutterLayout(extendMutterDisplays, 'PBP + extend displays', changed ?? ddcConnector);
+        });
     }
 
     _isWayland() {
